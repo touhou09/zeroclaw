@@ -14,6 +14,12 @@ site/public/docs-content/
 gh-pages/
 .idea
 .claude
+.vscode/
+.vs/
+.fleet/
+.zed/
+.history/
+*.code-workspace
 
 # Environment files (may contain secrets)
 .env
