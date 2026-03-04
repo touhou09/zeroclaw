@@ -1,4 +1,10 @@
-# Release — triggered by a v* tag push (e.g. v0.2.0).
+# Release — triggered by a v* tag push.
+#
+# Stable release:     v1.2.3          → GitHub Release (stable), Docker :1.2.3 + :latest
+# Pre-release:        v1.2.3-alpha.1  → GitHub Release (pre-release), Docker :1.2.3-alpha.1 only
+#                     v1.2.3-beta.2
+#                     v1.2.3-rc.1
+#
 # Jobs: build binaries (matrix), docker push to ghcr.io, publish GitHub Release.
 # Compute: Azure DevOps. Distribution: GitHub Releases + ghcr.io.
 #
@@ -36,11 +42,37 @@ variables:
     value: $(Build.Repository.Name)
 
 stages:
+  # ── Stage 0: Classify Tag ───────────────────────────────────────────────────
+  # Detects whether this is a stable release or a pre-release (alpha/beta/rc).
+  # Sets IS_PRERELEASE=true for any tag containing a hyphen (e.g. v1.0.0-alpha.1).
+  # Downstream stages read this variable to control Docker :latest and GitHub
+  # Release pre-release flag.
+  - stage: Classify
+    displayName: Classify Tag
+    jobs:
+      - job: ClassifyTag
+        displayName: Detect stable vs pre-release
+        pool:
+          vmImage: ubuntu-latest
+        steps:
+          - bash: |
+              TAG="$(Build.SourceBranchName)"   # e.g. v1.2.3 or v1.2.3-alpha.1
+              if [[ "$TAG" == *-* ]]; then
+                echo "Tag '$TAG' is a pre-release."
+                echo "##vso[task.setvariable variable=IS_PRERELEASE;isOutput=true]true"
+              else
+                echo "Tag '$TAG' is a stable release."
+                echo "##vso[task.setvariable variable=IS_PRERELEASE;isOutput=true]false"
+              fi
+            name: classify
+            displayName: Classify tag
+
   # ── Stage 1: Build Release Binaries ────────────────────────────────────────
   # Compiles a stripped release binary for each target platform in parallel.
   # Artifacts are published and downloaded by the Publish stage.
   - stage: Build
     displayName: Build
+    dependsOn: Classify
     jobs:
       - job: BuildBinary
         displayName: "Build"
@@ -135,10 +167,15 @@ stages:
   # ── Stage 2: Docker Release Image ──────────────────────────────────────────
   # Builds a multi-arch (amd64 + arm64) image using pre-built binaries from
   # the Build stage. No Rust compilation inside Docker — runs in ~3-5 min.
-  # Pushes to ghcr.io using GITHUB_TOKEN from the release-secrets variable group.
+  # Stable:     tags :1.2.3, :1.2, :sha-<sha>, :latest
+  # Pre-release: tags :1.2.3-alpha.1, :sha-<sha>  (no :latest)
   - stage: Docker
     displayName: Docker
-    dependsOn: Build
+    dependsOn:
+      - Classify
+      - Build
+    variables:
+      IS_PRERELEASE: $[ stageDependencies.Classify.ClassifyTag.outputs['classify.IS_PRERELEASE'] ]
     jobs:
       - job: DockerPush
         displayName: Build and push multi-arch image
@@ -167,15 +204,21 @@ stages:
             displayName: Unpack binaries
             workingDirectory: $(Build.SourcesDirectory)
 
-          # Compute tags: semver (e.g. 0.2.0), major.minor (e.g. 0.2), sha, latest
-          - script: |
-              TAG=$(Build.SourceBranchName)            # e.g. v0.2.0
-              VERSION=${TAG#v}                          # e.g. 0.2.0
-              MAJOR_MINOR=$(echo $VERSION | cut -d. -f1-2)  # e.g. 0.2
-              SHORT_SHA=$(echo $(Build.SourceVersion) | cut -c1-12)
-              IMAGE=$(REGISTRY)/$(IMAGE_NAME)
+          # Stable:      :1.2.3  :1.2  :sha-<sha>  :latest
+          # Pre-release: :1.2.3-alpha.1  :sha-<sha>  (no :latest — keeps stable image clean)
+          - bash: |
+              TAG="$(Build.SourceBranchName)"         # e.g. v1.2.3 or v1.2.3-alpha.1
+              VERSION="${TAG#v}"                        # e.g. 1.2.3 or 1.2.3-alpha.1
+              SHORT_SHA="$(echo $(Build.SourceVersion) | cut -c1-12)"
+              IMAGE="$(REGISTRY)/$(IMAGE_NAME)"
 
-              TAGS="${IMAGE}:${VERSION} ${IMAGE}:${MAJOR_MINOR} ${IMAGE}:sha-${SHORT_SHA} ${IMAGE}:latest"
+              TAGS="${IMAGE}:${VERSION} ${IMAGE}:sha-${SHORT_SHA}"
+
+              if [ "$(IS_PRERELEASE)" = "false" ]; then
+                MAJOR_MINOR="$(echo $VERSION | cut -d. -f1-2)"
+                TAGS="$TAGS ${IMAGE}:${MAJOR_MINOR} ${IMAGE}:latest"
+              fi
+
               echo "##vso[task.setvariable variable=IMAGE_TAGS]$TAGS"
               echo "Tags: $TAGS"
             displayName: Compute image tags
@@ -212,11 +255,15 @@ stages:
   # ── Stage 3: Publish GitHub Release ────────────────────────────────────────
   # Downloads all build artifacts, generates SBOM + checksums, signs with
   # cosign keyless, and creates the GitHub Release.
+  # Stable releases are marked as latest. Pre-releases are marked as pre-release.
   - stage: Publish
     displayName: Publish
     dependsOn:
+      - Classify
       - Build
       - Docker
+    variables:
+      IS_PRERELEASE: $[ stageDependencies.Classify.ClassifyTag.outputs['classify.IS_PRERELEASE'] ]
     jobs:
       - job: PublishRelease
         displayName: Publish GitHub Release
@@ -276,6 +323,7 @@ stages:
             displayName: Sign all release artifacts (cosign keyless)
 
           # Create the GitHub Release with all artifacts attached.
+          # isPreRelease is set automatically based on the tag suffix.
           # Uses the GitHubRelease task — requires a GitHub service connection
           # configured in Azure DevOps (Project Settings → Service connections).
           - task: GitHubRelease@1
@@ -288,5 +336,6 @@ stages:
               tagSource: gitTag
               title: $(Build.SourceBranchName)
               releaseNotesSource: githubReleaseNotes
+              isPreRelease: $(IS_PRERELEASE)
               assets: $(Build.ArtifactStagingDirectory)/artifacts/*
               addChangeLog: true
