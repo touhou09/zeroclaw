@@ -1952,33 +1952,34 @@ async fn execute_one_tool(
 
     tracing::info!(tool = %call_name, "Executing tool");
     let tool_future = tool.execute(call_arguments);
-    const TOOL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+    const DEFAULT_TOOL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+    let effective_timeout = tool.timeout_override().unwrap_or(DEFAULT_TOOL_TIMEOUT);
     let tool_result = if let Some(token) = cancellation_token {
         tokio::select! {
             () = token.cancelled() => return Err(ToolLoopCancelled.into()),
-            result = tokio::time::timeout(TOOL_TIMEOUT, tool_future) => match result {
+            result = tokio::time::timeout(effective_timeout, tool_future) => match result {
                 Ok(r) => r,
                 Err(_) => {
-                    tracing::warn!(tool = %call_name, timeout_secs = TOOL_TIMEOUT.as_secs(), "Tool execution timed out");
+                    tracing::warn!(tool = %call_name, timeout_secs = effective_timeout.as_secs(), "Tool execution timed out");
                     Ok(crate::tools::ToolResult {
                         success: false,
                         output: String::new(),
-                        error: Some(format!("Tool '{call_name}' timed out after {}s", TOOL_TIMEOUT.as_secs())),
+                        error: Some(format!("Tool '{call_name}' timed out after {}s", effective_timeout.as_secs())),
                     })
                 }
             },
         }
     } else {
-        match tokio::time::timeout(TOOL_TIMEOUT, tool_future).await {
+        match tokio::time::timeout(effective_timeout, tool_future).await {
             Ok(r) => r,
             Err(_) => {
-                tracing::warn!(tool = %call_name, timeout_secs = TOOL_TIMEOUT.as_secs(), "Tool execution timed out");
+                tracing::warn!(tool = %call_name, timeout_secs = effective_timeout.as_secs(), "Tool execution timed out");
                 Ok(crate::tools::ToolResult {
                     success: false,
                     output: String::new(),
                     error: Some(format!(
                         "Tool '{call_name}' timed out after {}s",
-                        TOOL_TIMEOUT.as_secs()
+                        effective_timeout.as_secs()
                     )),
                 })
             }

@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 /// Default shell command execution timeout before kill.
-const SHELL_TIMEOUT_SECS: u64 = 60;
+const SHELL_TIMEOUT_SECS: u64 = 120;
 /// Maximum allowed per-command timeout.
 const SHELL_TIMEOUT_MAX_SECS: u64 = 3_600;
 /// Maximum output size in bytes (1MB).
@@ -69,6 +69,12 @@ impl Tool for ShellTool {
         "Execute a shell command in the workspace directory"
     }
 
+    fn timeout_override(&self) -> Option<std::time::Duration> {
+        // Shell manages its own timeout via timeout_seconds parameter.
+        // Set outer timeout with margin so shell's internal timeout fires first.
+        Some(Duration::from_secs(SHELL_TIMEOUT_MAX_SECS + 30))
+    }
+
     fn parameters_schema(&self) -> serde_json::Value {
         json!({
             "type": "object",
@@ -86,7 +92,7 @@ impl Tool for ShellTool {
                     "type": "integer",
                     "minimum": 1,
                     "maximum": 3600,
-                    "description": "Optional command timeout in seconds (default: 60)"
+                    "description": "Optional command timeout in seconds (default: 120)"
                 }
             },
             "required": ["command"]
@@ -187,12 +193,43 @@ impl Tool for ShellTool {
             }
         }
 
-        let result = tokio::time::timeout(Duration::from_secs(timeout_seconds), cmd.output()).await;
+        cmd.stdout(std::process::Stdio::piped());
+        cmd.stderr(std::process::Stdio::piped());
+        let mut child = match cmd.kill_on_drop(true).spawn() {
+            Ok(child) => child,
+            Err(e) => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(format!("Failed to execute command: {e}")),
+                });
+            }
+        };
+
+        // Take stdout/stderr handles before waiting so we can still kill on timeout.
+        let child_stdout = child.stdout.take();
+        let child_stderr = child.stderr.take();
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(timeout_seconds),
+            child.wait(),
+        )
+        .await;
 
         match result {
-            Ok(Ok(output)) => {
-                let mut stdout = String::from_utf8_lossy(&output.stdout).to_string();
-                let mut stderr = String::from_utf8_lossy(&output.stderr).to_string();
+            Ok(Ok(status)) => {
+                // Read captured output after process exits.
+                let mut stdout_bytes = Vec::new();
+                let mut stderr_bytes = Vec::new();
+                if let Some(mut out) = child_stdout {
+                    let _ = tokio::io::AsyncReadExt::read_to_end(&mut out, &mut stdout_bytes).await;
+                }
+                if let Some(mut err) = child_stderr {
+                    let _ = tokio::io::AsyncReadExt::read_to_end(&mut err, &mut stderr_bytes).await;
+                }
+
+                let mut stdout = String::from_utf8_lossy(&stdout_bytes).to_string();
+                let mut stderr = String::from_utf8_lossy(&stderr_bytes).to_string();
 
                 // Truncate output to prevent OOM
                 if stdout.len() > MAX_OUTPUT_BYTES {
@@ -205,7 +242,7 @@ impl Tool for ShellTool {
                 }
 
                 Ok(ToolResult {
-                    success: output.status.success(),
+                    success: status.success(),
                     output: stdout,
                     error: if stderr.is_empty() {
                         None
@@ -219,13 +256,19 @@ impl Tool for ShellTool {
                 output: String::new(),
                 error: Some(format!("Failed to execute command: {e}")),
             }),
-            Err(_) => Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some(format!(
-                    "Command timed out after {timeout_seconds}s and was killed"
-                )),
-            }),
+            Err(_) => {
+                // Timeout: explicitly kill the child process to prevent zombies.
+                // kill_on_drop(true) above provides a safety net, but we kill explicitly
+                // to ensure immediate cleanup.
+                let _ = child.kill().await;
+                Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(format!(
+                        "Command timed out after {timeout_seconds}s and was killed"
+                    )),
+                })
+            }
         }
     }
 }
@@ -584,7 +627,7 @@ mod tests {
 
     #[test]
     fn shell_timeout_constant_is_reasonable() {
-        assert_eq!(SHELL_TIMEOUT_SECS, 60, "shell timeout must be 60 seconds");
+        assert_eq!(SHELL_TIMEOUT_SECS, 120, "shell timeout must be 120 seconds");
         assert!(
             SHELL_TIMEOUT_MAX_SECS >= SHELL_TIMEOUT_SECS,
             "max timeout must be >= default timeout"

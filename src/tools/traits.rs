@@ -32,6 +32,12 @@ pub trait Tool: Send + Sync {
     /// Execute the tool with given arguments
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult>;
 
+    /// If the tool manages its own timeout (e.g. shell), return an override
+    /// for the outer TOOL_TIMEOUT. `None` means use the default.
+    fn timeout_override(&self) -> Option<std::time::Duration> {
+        None
+    }
+
     /// Get the full spec for LLM registration
     fn spec(&self) -> ToolSpec {
         ToolSpec {
