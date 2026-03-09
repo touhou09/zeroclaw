@@ -45,6 +45,8 @@ pub mod memory_recall;
 pub mod memory_store;
 pub mod model_routing_config;
 pub mod pdf_read;
+pub mod process;
+pub mod process_registry;
 pub mod proxy_config;
 pub mod pushover;
 pub mod schedule;
@@ -86,6 +88,8 @@ pub use memory_recall::MemoryRecallTool;
 pub use memory_store::MemoryStoreTool;
 pub use model_routing_config::ModelRoutingConfigTool;
 pub use pdf_read::PdfReadTool;
+pub use process::ProcessTool;
+pub use process_registry::ProcessRegistry;
 pub use proxy_config::ProxyConfigTool;
 pub use pushover::PushoverTool;
 pub use schedule::ScheduleTool;
@@ -216,8 +220,15 @@ pub fn all_tools_with_runtime(
     root_config: &crate::config::Config,
     subagent_registry: Option<Arc<SubagentRegistry>>,
 ) -> Vec<Box<dyn Tool>> {
+    // Create a shared process registry for background shell execution.
+    let process_registry = Arc::new(ProcessRegistry::new());
+    process_registry.start_sweeper();
+
     let mut tool_arcs: Vec<Arc<dyn Tool>> = vec![
-        Arc::new(ShellTool::new(security.clone(), runtime)),
+        Arc::new(
+            ShellTool::new(security.clone(), runtime)
+                .with_process_registry(process_registry.clone()),
+        ),
         Arc::new(FileReadTool::new(security.clone())),
         Arc::new(FileWriteTool::new(security.clone())),
         Arc::new(FileEditTool::new(security.clone())),
@@ -246,6 +257,7 @@ pub fn all_tools_with_runtime(
             security.clone(),
             workspace_dir.to_path_buf(),
         )),
+        Arc::new(ProcessTool::new(process_registry)),
     ];
 
     if browser_config.enabled {

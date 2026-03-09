@@ -1,3 +1,4 @@
+use super::process_registry::{ProcessRegistry, ProcessSession};
 use super::traits::{Tool, ToolResult};
 use crate::runtime::RuntimeAdapter;
 use crate::security::SecurityPolicy;
@@ -23,11 +24,22 @@ const SAFE_ENV_VARS: &[&str] = &[
 pub struct ShellTool {
     security: Arc<SecurityPolicy>,
     runtime: Arc<dyn RuntimeAdapter>,
+    process_registry: Option<Arc<ProcessRegistry>>,
 }
 
 impl ShellTool {
     pub fn new(security: Arc<SecurityPolicy>, runtime: Arc<dyn RuntimeAdapter>) -> Self {
-        Self { security, runtime }
+        Self {
+            security,
+            runtime,
+            process_registry: None,
+        }
+    }
+
+    /// Create a ShellTool with a process registry for background execution support.
+    pub fn with_process_registry(mut self, registry: Arc<ProcessRegistry>) -> Self {
+        self.process_registry = Some(registry);
+        self
     }
 }
 
@@ -93,6 +105,15 @@ impl Tool for ShellTool {
                     "minimum": 1,
                     "maximum": 3600,
                     "description": "Optional command timeout in seconds (default: 120)"
+                },
+                "background": {
+                    "type": "boolean",
+                    "description": "Run the command in background. Returns immediately with a session_id for use with the process tool (poll/kill/log). No timeout is applied.",
+                    "default": false
+                },
+                "scope_key": {
+                    "type": "string",
+                    "description": "Agent scope key for session isolation (background only)"
                 }
             },
             "required": ["command"]
@@ -108,6 +129,11 @@ impl Tool for ShellTool {
             .get("approved")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
+        let background = args
+            .get("background")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let scope_key = args.get("scope_key").and_then(|v| v.as_str());
         let timeout_seconds = match args.get("timeout_seconds") {
             Some(raw) => {
                 let parsed = raw
@@ -195,6 +221,9 @@ impl Tool for ShellTool {
 
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
+        if background {
+            cmd.stdin(std::process::Stdio::piped());
+        }
         let mut child = match cmd.kill_on_drop(true).spawn() {
             Ok(child) => child,
             Err(e) => {
@@ -206,15 +235,141 @@ impl Tool for ShellTool {
             }
         };
 
+        // ── Background execution path ──────────────────────────────
+        if background {
+            let registry = match &self.process_registry {
+                Some(r) => r.clone(),
+                None => {
+                    let _ = child.kill().await;
+                    return Ok(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(
+                            "Background execution is not available (no process registry configured)"
+                                .into(),
+                        ),
+                    });
+                }
+            };
+
+            if !registry.can_spawn().await {
+                let _ = child.kill().await;
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(
+                        "Maximum concurrent background processes reached (5). Kill an existing process first."
+                            .into(),
+                    ),
+                });
+            }
+
+            let pid = child.id().unwrap_or(0);
+            let session_id = uuid::Uuid::new_v4().to_string();
+
+            // Take stdout/stderr for the background reader task.
+            let bg_stdout = child.stdout.take();
+            let bg_stderr = child.stderr.take();
+
+            let session = ProcessSession::new(session_id.clone(), pid, command.to_string(), child)
+                .with_scope_key(scope_key.map(|s| s.to_string()));
+            registry.register(session).await;
+
+            // Helper: spawn a reader task for a pipe handle.
+            async fn pipe_reader(
+                mut pipe: tokio::process::ChildStdout,
+                reg: Arc<ProcessRegistry>,
+                sid: String,
+            ) {
+                let mut buf = [0u8; 4096];
+                loop {
+                    match tokio::io::AsyncReadExt::read(&mut pipe, &mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => reg.append_output(&sid, &buf[..n]).await,
+                    }
+                }
+            }
+
+            async fn pipe_reader_stderr(
+                mut pipe: tokio::process::ChildStderr,
+                reg: Arc<ProcessRegistry>,
+                sid: String,
+            ) {
+                let mut buf = [0u8; 4096];
+                loop {
+                    match tokio::io::AsyncReadExt::read(&mut pipe, &mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => reg.append_output(&sid, &buf[..n]).await,
+                    }
+                }
+            }
+
+            // Spawn reader tasks for stdout and stderr.
+            if let Some(stdout) = bg_stdout {
+                tokio::spawn(pipe_reader(stdout, registry.clone(), session_id.clone()));
+            }
+            if let Some(stderr) = bg_stderr {
+                tokio::spawn(pipe_reader_stderr(
+                    stderr,
+                    registry.clone(),
+                    session_id.clone(),
+                ));
+            }
+
+            // Spawn a waiter task that detects process exit via the child handle
+            // stored in the registry. Uses wait_with_child on the registry.
+            let reg_exit = registry.clone();
+            let sid_exit = session_id.clone();
+            tokio::spawn(async move {
+                // The child was moved into the ProcessSession. We need to
+                // wait externally by polling /proc or similar. Instead, we
+                // use a simple poll loop checking if the process group is alive.
+                #[cfg(unix)]
+                {
+                    loop {
+                        tokio::time::sleep(Duration::from_millis(500)).await;
+                        // Check if process group is still alive.
+                        let alive = unsafe { libc::kill(-(pid as i32), 0) } == 0;
+                        if !alive {
+                            reg_exit.mark_exited(&sid_exit, 0).await;
+                            break;
+                        }
+                    }
+                }
+                #[cfg(not(unix))]
+                {
+                    // Non-unix: simple polling fallback.
+                    loop {
+                        tokio::time::sleep(Duration::from_millis(500)).await;
+                        if let Some(result) = reg_exit.poll(&sid_exit).await {
+                            if !result.is_running {
+                                break;
+                            }
+                        } else {
+                            break;
+                        }
+                    }
+                }
+            });
+
+            return Ok(ToolResult {
+                success: true,
+                output: serde_json::to_string_pretty(&json!({
+                    "session_id": session_id,
+                    "pid": pid,
+                    "status": "backgrounded"
+                }))
+                .unwrap_or_default(),
+                error: None,
+            });
+        }
+
+        // ── Foreground execution path ──────────────────────────────
         // Take stdout/stderr handles before waiting so we can still kill on timeout.
         let child_stdout = child.stdout.take();
         let child_stderr = child.stderr.take();
 
-        let result = tokio::time::timeout(
-            Duration::from_secs(timeout_seconds),
-            child.wait(),
-        )
-        .await;
+        let result = tokio::time::timeout(Duration::from_secs(timeout_seconds), child.wait()).await;
 
         match result {
             Ok(Ok(status)) => {
@@ -257,10 +412,11 @@ impl Tool for ShellTool {
                 error: Some(format!("Failed to execute command: {e}")),
             }),
             Err(_) => {
-                // Timeout: explicitly kill the child process to prevent zombies.
+                // Timeout: kill the entire process group to prevent zombies.
                 // kill_on_drop(true) above provides a safety net, but we kill explicitly
-                // to ensure immediate cleanup.
-                let _ = child.kill().await;
+                // via process group to ensure all children are cleaned up.
+                crate::runtime::process_kill::kill_process_tree(&mut child, Duration::from_secs(3))
+                    .await;
                 Ok(ToolResult {
                     success: false,
                     output: String::new(),

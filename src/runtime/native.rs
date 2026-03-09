@@ -41,6 +41,20 @@ impl RuntimeAdapter for NativeRuntime {
     ) -> anyhow::Result<tokio::process::Command> {
         let mut process = tokio::process::Command::new("sh");
         process.arg("-c").arg(command).current_dir(workspace_dir);
+
+        // Make the child a session leader so we can kill the entire process group
+        // (all grandchildren) via kill(-pid, sig) instead of leaking zombies.
+        #[cfg(unix)]
+        {
+            // Safety: setsid() is a standard POSIX call with no unsafe memory access.
+            unsafe {
+                process.pre_exec(|| {
+                    libc::setsid();
+                    Ok(())
+                });
+            }
+        }
+
         Ok(process)
     }
 }

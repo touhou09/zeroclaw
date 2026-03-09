@@ -56,12 +56,15 @@ pub(crate) fn new_shared_process() -> SharedProcess {
     Arc::new(Mutex::new(None))
 }
 
-/// Kill a shared tunnel process if running.
+/// Kill a shared tunnel process (and its process group) if running.
 pub(crate) async fn kill_shared(proc: &SharedProcess) -> Result<()> {
     let mut guard = proc.lock().await;
     if let Some(ref mut tp) = *guard {
-        tp.child.kill().await.ok();
-        tp.child.wait().await.ok();
+        crate::runtime::process_kill::kill_process_tree(
+            &mut tp.child,
+            std::time::Duration::from_secs(3),
+        )
+        .await;
     }
     *guard = None;
     Ok(())

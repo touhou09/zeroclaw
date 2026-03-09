@@ -427,37 +427,68 @@ async fn run_job_command_with_timeout(
         );
     }
 
-    let child = match Command::new("sh")
-        .arg("-lc")
+    let mut cmd = Command::new("sh");
+    cmd.arg("-lc")
         .arg(&job.command)
         .current_dir(&config.workspace_dir)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
+        .kill_on_drop(true);
+
+    // Make the cron child a session leader so we can kill its entire process group.
+    #[cfg(unix)]
     {
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            });
+        }
+    }
+
+    let mut child = match cmd.spawn() {
         Ok(child) => child,
         Err(e) => return (false, format!("spawn error: {e}")),
     };
 
-    match time::timeout(timeout, child.wait_with_output()).await {
-        Ok(Ok(output)) => {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            let stderr = String::from_utf8_lossy(&output.stderr);
+    // Take stdout/stderr handles before waiting so we retain access on timeout.
+    let child_stdout = child.stdout.take();
+    let child_stderr = child.stderr.take();
+
+    match time::timeout(timeout, child.wait()).await {
+        Ok(Ok(status)) => {
+            let mut stdout_bytes = Vec::new();
+            let mut stderr_bytes = Vec::new();
+            if let Some(mut out) = child_stdout {
+                let _ = tokio::io::AsyncReadExt::read_to_end(&mut out, &mut stdout_bytes).await;
+            }
+            if let Some(mut err) = child_stderr {
+                let _ = tokio::io::AsyncReadExt::read_to_end(&mut err, &mut stderr_bytes).await;
+            }
+            let stdout = String::from_utf8_lossy(&stdout_bytes);
+            let stderr = String::from_utf8_lossy(&stderr_bytes);
             let combined = format!(
                 "status={}\nstdout:\n{}\nstderr:\n{}",
-                output.status,
+                status,
                 stdout.trim(),
                 stderr.trim()
             );
-            (output.status.success(), combined)
+            (status.success(), combined)
         }
         Ok(Err(e)) => (false, format!("spawn error: {e}")),
-        Err(_) => (
-            false,
-            format!("job timed out after {}s", timeout.as_secs_f64()),
-        ),
+        Err(_) => {
+            // Kill the entire process group on timeout.
+            crate::runtime::process_kill::kill_process_tree(
+                &mut child,
+                std::time::Duration::from_secs(3),
+            )
+            .await;
+            (
+                false,
+                format!("job timed out after {}s", timeout.as_secs_f64()),
+            )
+        }
     }
 }
 

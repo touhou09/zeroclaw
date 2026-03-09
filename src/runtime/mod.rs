@@ -1,5 +1,6 @@
 pub mod docker;
 pub mod native;
+pub mod process_kill;
 pub mod traits;
 
 pub use docker::DockerRuntime;
